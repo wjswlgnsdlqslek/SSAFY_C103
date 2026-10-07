@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 from confluent_kafka import Producer
 import json
+import os
+from collections import deque
 from tensorflow.keras.models import load_model as keras_load_model
 from sklearn.preprocessing import MinMaxScaler
 import logging
@@ -61,15 +63,21 @@ producer = Producer(conf)
 # 로그 설정
 logging.basicConfig(filename='error.log', level=logging.ERROR)
 
-# 머신러닝 모델 로딩
-MODEL_PATH = 'ml/trained_model/autoencoder_model.h5'
-scaler_path = 'ml/trained_model/scaler_model.pkl'  # 기존 학습에 사용된 스케일러 파일 경로
+# 머신러닝 모델 로딩 (app.py 위치 기준 상대 경로 — 실행 CWD에 영향받지 않음)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, 'trained_model', 'autoencoder_model.h5')
+scaler_path = os.path.join(BASE_DIR, 'trained_model', 'scaler_model.pkl')  # 기존 학습에 사용된 스케일러 파일 경로
 
 # 재학습에 필요한 데이터 설정
 RETRAIN_THRESHOLD = 1000  # 재학습할 때 필요한 데이터 수
 normal_data_cache = []  # 정상 데이터를 캐시할 리스트
 
 PERCENTILE_THRESHOLD = 60
+
+# 최근 재구성 오차 보관 (동적 임계값 계산용 롤링 윈도우)
+mse_history = deque(maxlen=1000)
+MSE_WARMUP_MIN = 30    # 임계값 계산에 필요한 최소 샘플 수
+DEFAULT_THRESHOLD = 1.5  # 워밍업 구간 기본 임계값
 
 def load_model():
     try:
@@ -88,22 +96,28 @@ model = load_model()
 def check_missing_values(data):
     for key in data:
         if data[key] is None or pd.isna(data[key]):
-            if key == 'deposit' or key == 'period':
-                median_value = np.median([d for d in data[key] if d is not None])
-                data[key] = median_value
-            else:
-                data[key] = 0  # 기본값 0으로 대체
+            # 단일 요청에서는 중앙값을 구할 수 없으므로 0으로 대체
+            # (기존 코드는 스칼라에 대해 np.median(listcomp)을 돌려 TypeError 발생)
+            data[key] = 0
     return data
 
-# 동적 임계값 설정 함수 (백분위수 + 평균/표준편차 기반)
+# 동적 임계값 설정 함수 (최근 재구성 오차 분포 기준)
+# - 단일 요청의 MSE 1개로 백분위수를 구하면 임계값이 자기 자신이 되어
+#   탐지가 절대 발화하지 않으므로, 롤링 윈도우 분포로 계산한다
 def dynamic_threshold(mse):
-    threshold_percentile = np.percentile(mse, PERCENTILE_THRESHOLD)
-    mean_mse = np.mean(mse)
-    std_mse = np.std(mse)
+    mse_history.extend(np.atleast_1d(mse).tolist())
+    if len(mse_history) < MSE_WARMUP_MIN:
+        return DEFAULT_THRESHOLD
+    arr = np.array(mse_history)
+    threshold_percentile = np.percentile(arr, PERCENTILE_THRESHOLD)
+    mean_mse = np.mean(arr)
+    std_mse = np.std(arr)
     threshold_std = mean_mse + 3 * std_mse
     return max(threshold_percentile, threshold_std)
 
 # 전처리 함수 정의
+# 스케일러/모델은 5개 피처 [deposit, period, price_per_day, month, level] 로 학습됨
+# (스케일러 통계 mean_=[1527, 75, 54, 2.02, 1.72] 와 대조하여 순서 확정)
 def preprocess_data(data, scaler):
     data = check_missing_values(data)
     required_fields = ['period', 'deposit', 'level']
@@ -116,7 +130,8 @@ def preprocess_data(data, scaler):
     month = np.where(period >= 31, period // 30, 1)
     price_per_day = (total_price / period) * month
 
-    features = np.hstack((total_price, price_per_day, level))
+    # 학습 시점과 동일한 5개 피처·순서 유지 (순서가 바뀌면 스케일러 통계가 어긋남)
+    features = np.hstack((total_price, period, price_per_day, month, level))
 
     scaled_features = scaler.transform(features)
 
